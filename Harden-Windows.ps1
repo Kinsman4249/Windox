@@ -66,9 +66,19 @@ $Backup = [ordered]@{
     Firewall   = $null
     Defender   = $null
     ExecutionPol = $null
+    AuditPolFile = $null
+    SecPolFile   = $null
+    PSv2         = $null
+    PSOpLogSize  = $null
+    TranscriptionDirCreated = $false
+    GuestEnabled = $null
+    FirewallLog  = @{}
 }
 if (Test-Path $BackupFile) {
     try { $Backup = Get-Content $BackupFile -Raw | ConvertFrom-Json } catch { Write-Log "WARN: backup unreadable, starting fresh backup."; $Backup.Registry = @(); $Backup.Services = @(); $Backup.Tasks = @(); $Backup.Apps = @() }
+    foreach ($f in @('AuditPolFile','SecPolFile','PSv2','PSOpLogSize','TranscriptionDirCreated','GuestEnabled','FirewallLog')) {
+        if ($null -eq $Backup.$f) { $Backup | Add-Member -NotePropertyName $f -NotePropertyValue ($(if ($f -eq 'TranscriptionDirCreated') { $false } elseif ($f -eq 'FirewallLog') { @{} } else { $null })) -Force }
+    }
 }
 function Save-Backup {
     $json = ConvertTo-Json -InputObject ([pscustomobject]$Backup) -Depth 6
@@ -144,6 +154,46 @@ function Set-ServiceManualSafe {
     if ($svc.Status -eq 'Running') { Stop-Service -Name $Name -Force -WarningAction SilentlyContinue }
     Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name Start -Value 3
     Write-Log "  service set to Manual: $Name"
+}
+
+# Captures the current Defender state exactly once (used by the network section
+# and the defense-in-depth section) so undo can restore it fully.
+function Backup-DefenderState {
+    if ($null -ne $Backup.Defender) { return }
+    $asr = Get-MpPreference -ErrorAction SilentlyContinue
+    if (-not $asr) { return }
+    $Backup.Defender = New-Object psobject -Property @{
+        ASRIds    = @($asr.AttackSurfaceReductionRules_Ids)
+        ASRAction = @($asr.AttackSurfaceReductionRules_Actions)
+        CloudBlockLevel    = $asr.CloudBlockLevel
+        CloudExtendedTimeout = $asr.CloudExtendedTimeout
+        EnableNetworkProtection = $asr.EnableNetworkProtection
+        PUAProtection      = $asr.PUAProtection
+        SubmitSamplesConsent = $asr.SubmitSamplesConsent
+        CFA = $asr.EnableControlledFolderAccess
+        CFAApps = @($asr.ControlledFolderAccessAllowedApplications)
+        ScanAvgCPULoadFactor = $asr.ScanAvgCPULoadFactor
+        EnableLowCpuPriority = $asr.EnableLowCpuPriority
+        CheckForSignaturesBeforeRunningScan = $asr.CheckForSignaturesBeforeRunningScan
+    }
+}
+
+# Removes anonymous named-pipe/share lists entirely (an absent list is a blank
+# list). Only backs up the value when it exists, so undo restores exactly.
+function Clear-NullSessionList {
+    param([Parameter(Mandatory)][string]$Name)
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters', $true)
+    if (-not $key) { return }
+    $exists = $key.GetValueNames() -contains $Name
+    if ($exists) {
+        if (-not (Test-BackupHasReg -Hive 'HKLM' -Path 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name $Name)) {
+            $entry = [ordered]@{ Hive='HKLM'; Path='SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Name=$Name; Existed=$true; Type=[string]$key.GetValueKind($Name); Data=$key.GetValue($Name) }
+            $Backup.Registry += (New-Object psobject -Property $entry)
+        }
+        $key.DeleteValue($Name)
+        Write-Log "  cleared anonymous $Name"
+    }
+    $key.Close()
 }
 
 # ---------------------------------------------------------------- 1. telemetry
@@ -321,6 +371,8 @@ if (-not $SkipNetwork) {
     Set-SmbServerConfiguration -EnableSMB2Protocol $true  -Force
     # LLMNR off (poisoning/relay attacks)
     Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast' 0
+    # mDNS off (CIS 18.6.4.1) - the third name-resolution poison vector after LLMNR/NetBIOS
+    Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMDNS' 0
     # NetBIOS over TCP off on all interfaces
     Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces' | ForEach-Object {
         $sub = $_.Name -replace '^HKEY_LOCAL_MACHINE\\',''
@@ -355,18 +407,8 @@ if (-not $SkipNetwork) {
     # Firewall: default-deny inbound
     Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow
     # Defender: MS-baseline cloud/PUA/network settings + full ASR set
+    Backup-DefenderState
     $asr = Get-MpPreference
-    if ($null -eq $Backup.Defender) {
-        $Backup.Defender = New-Object psobject -Property @{
-            ASRIds    = @($asr.AttackSurfaceReductionRules_Ids)
-            ASRAction = @($asr.AttackSurfaceReductionRules_Actions)
-            CloudBlockLevel    = $asr.CloudBlockLevel
-            CloudExtendedTimeout = $asr.CloudExtendedTimeout
-            EnableNetworkProtection = $asr.EnableNetworkProtection
-            PUAProtection      = $asr.PUAProtection
-            SubmitSamplesConsent = $asr.SubmitSamplesConsent
-        }
-    }
     # id -> action: 1 = block, 2 = audit
     $asrMap = [ordered]@{
         '7674ba52-37eb-4664-abf5-4c0f867f5ccc' = 1  # Office child processes
@@ -474,6 +516,185 @@ Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\Sudo' 'Enabled' 0
 # Machine inactivity limit: lock after 15 min idle
 Set-Reg HKLM 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'InactivityTimeoutSecs' 900
 Write-Log '  baseline settings applied'
+
+# ---------------------------------------------------------------- 4c. defense-in-depth (CIS / ACSC / NSA / STIG)
+Write-Log '== 4c. Defense-in-depth (CIS / ACSC / NSA / STIG) =='
+
+# --- PowerShell deep logging (NSA/CISA "Keeping PowerShell" 2022, CCCS ITSP.70.012,
+#     CIS 18.10.88) - logging only; does not restrict the local admin's shell. ---
+Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging' 'EnableModuleLogging' 1
+$ml = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames')
+if (-not (Test-BackupHasReg -Hive 'HKLM' -Path 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames' -Name '*')) {
+    $Backup.Registry += (New-Object psobject -Property @{ Hive='HKLM'; Path='SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames'; Name='*'; Existed=($null -ne $ml.GetValue('*')) })
+}
+$ml.SetValue('*', '*', [Microsoft.Win32.RegistryValueKind]::String)
+$ml.Close()
+Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription' 'EnableTranscripting' 1
+Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription' 'EnableInvocationHeader' 1
+$transDir = 'C:\Windows\Logs\PSTranscripts'
+if (-not (Test-Path $transDir)) {
+    New-Item -ItemType Directory -Path $transDir -Force | Out-Null
+    icacls $transDir /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+    $Backup.TranscriptionDirCreated = $true
+}
+Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription' 'OutputDirectory' $transDir -Type String
+Write-Log '  PowerShell module logging + transcription enabled (transcripts: C:\Windows\Logs\PSTranscripts)'
+
+# PowerShell v2 engine: deprecated, unneeded, and a favorite attack surface (NSA/CISA; STIG).
+$psv2 = Get-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2Root' -EA SilentlyContinue
+if ($psv2 -and $psv2.State -ne 'Disabled') {
+    if ($null -eq $Backup.PSv2) { $Backup.PSv2 = $psv2.State }
+    Disable-WindowsOptionalFeature -Online -FeatureName 'MicrosoftWindowsPowerShellV2Root' -NoRestart | Out-Null
+    Write-Log '  PowerShell v2 engine disabled'
+}
+# PowerShell Operational log: sized for the new logging (NSA/CISA).
+$psLogSize = (wevtutil gl 'Microsoft-Windows-PowerShell/Operational' 2>$null | Select-String 'maxSize:\s+(\d+)').Matches.Groups[1].Value
+if ($psLogSize) {
+    if ($null -eq $Backup.PSOpLogSize) { $Backup.PSOpLogSize = $psLogSize }
+    wevtutil sl 'Microsoft-Windows-PowerShell/Operational' /ms:104857600 | Out-Null
+    Write-Log '  PowerShell Operational log sized to 100 MB'
+}
+
+# --- Exploit Protection system defaults (MITRE M1050, ACSC, CCCS ITSP.70.012) ---
+# Safe system-wide set only; the app-breaking mitigations (BlockNonMicrosoftBinaries,
+# DisableNonSystemFonts, DisableWin32kSystemCalls, EAF) are deliberately not set.
+foreach ($epPath in @('SYSTEM\CurrentControlSet\Control\Session Manager\kernel','SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\*')) {
+    $epKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($epPath, $true)
+    if (-not $epKey) { continue }
+    if (-not (Test-BackupHasReg -Hive 'HKLM' -Path $epPath -Name 'MitigationOptions')) {
+        $epExisted = $null -ne $epKey.GetValue('MitigationOptions')
+        $epEntry = [ordered]@{ Hive='HKLM'; Path=$epPath; Name='MitigationOptions'; Existed=$epExisted }
+        if ($epExisted) { $epEntry.Type = [string]$epKey.GetValueKind('MitigationOptions'); $epEntry.Data = $epKey.GetValue('MitigationOptions') }
+        $Backup.Registry += (New-Object psobject -Property $epEntry)
+    }
+    $epKey.Close()
+}
+if (Get-Command Set-ProcessMitigation -EA SilentlyContinue) {
+    Set-ProcessMitigation -System -Enable DEP,EmulateAtlThunks,SEHOP,ForceRelocateImages,BottomUp,HighEntropy,StrictHandle,CFG,DisableExtensionPoints
+    Write-Log '  Exploit Protection system defaults applied (DEP, SEHOP, CFG, ASLR, handle validation)'
+} else {
+    Write-Log '  WARN: Set-ProcessMitigation unavailable - Exploit Protection skipped'
+}
+
+# --- Controlled Folder Access (ACSC, CIS Defender benchmark, vendor ransomware guidance) ---
+# PowerShell/pwsh are allow-listed so the local admin's scripts can still write
+# to protected folders; every other untrusted write is blocked.
+Backup-DefenderState
+$cfaAllow = @("$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe")
+$pwshSrc = (Get-Command pwsh.exe -EA SilentlyContinue).Source
+if ($pwshSrc) { $cfaAllow += $pwshSrc }
+if (Get-Command Set-MpPreference -EA SilentlyContinue) {
+    try {
+        Set-MpPreference -EnableControlledFolderAccess Enabled
+        Set-MpPreference -ControlledFolderAccessAllowedApplications $cfaAllow
+        Write-Log '  Controlled Folder Access: Block mode (powershell/pwsh allow-listed)'
+    } catch { Write-Log ("  WARN: Controlled Folder Access could not be enabled: " + $_.Exception.Message) }
+    # Scheduled-scan optimization (MS Set-MpPreference docs): keep scans out of the way.
+    try { Set-MpPreference -ScanAvgCPULoadFactor 30 } catch {}
+    try { Set-MpPreference -EnableLowCpuPriority $true } catch {}
+    try { Set-MpPreference -CheckForSignaturesBeforeRunningScan $true } catch {}
+}
+# Tamper Protection + real-time status: report, because Tamper Protection can
+# silently reject local changes to cloud-delivered protection settings.
+$mpStat = Get-MpComputerStatus -EA SilentlyContinue
+if ($mpStat) {
+    $tpVal = $null
+    if ($null -ne $mpStat.IsTamperProtected) { $tpVal = $mpStat.IsTamperProtected }
+    elseif ($null -ne $mpStat.TamperProtection) { $tpVal = ($mpStat.TamperProtection -match 'On|Enabled') }
+    if ($tpVal -eq $true) {
+        Write-Log '  Tamper Protection: ON (if any Set-MpPreference call reported an error, verify the affected value in Windows Security)'
+    } elseif ($tpVal -eq $false) {
+        Write-Log '  WARN: Tamper Protection is OFF - enable it in Windows Security > Virus & threat protection > Settings'
+    }
+    if (-not $mpStat.RealTimeProtectionEnabled) { Write-Log '  WARN: Defender real-time protection is OFF' }
+}
+
+# --- Credential hardening (CIS 2.3.x, DISA STIG WN11-SO-*) ---
+Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\Lsa' 'DisableDomainCreds' 1            # no stored network credentials
+Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\Lsa' 'LimitBlankPasswordUse' 1         # blank passwords only at the console
+Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\Lsa' 'RestrictNullSessAccess' 1        # no anonymous named-pipe/share access
+Clear-NullSessionList 'NullSessionPipes'
+Clear-NullSessionList 'NullSessionShares'
+Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\Session Manager' 'SafeDllSearchMode' 1  # DLL hijack hardening
+Set-Reg HKLM 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'DontDisplayLastUserName' 1
+Set-Reg HKLM 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoAdminLogon' '0' -Type String
+
+# Guest account disabled (CIS 2.3.1.1; STIG WN11-SO-000010)
+if (Get-Command Get-LocalUser -EA SilentlyContinue) {
+    $guestAcct = Get-LocalUser -Name 'Guest' -EA SilentlyContinue
+    if ($guestAcct) {
+        if ($null -eq $Backup.GuestEnabled) { $Backup.GuestEnabled = $guestAcct.Enabled }
+        if ($guestAcct.Enabled) {
+            Disable-LocalUser -Name 'Guest'
+            Write-Log '  Guest account disabled'
+        }
+    }
+}
+
+# --- Account lockout (ACSC high priority; CIS 1.2.x) ---
+$secPolFile = Join-Path $Root 'SecPolBackup.inf'
+if (-not (Test-Path $secPolFile)) {
+    secedit /export /cfg $secPolFile /areas SECURITYPOLICY | Out-Null
+    if (Test-Path $secPolFile) { if ($null -eq $Backup.SecPolFile) { $Backup.SecPolFile = $secPolFile } }
+    else { Write-Log '  WARN: could not export security policy - account lockout NOT applied' }
+}
+if (Test-Path $secPolFile) {
+    net accounts /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15 | Out-Null
+    Write-Log '  account lockout: 5 invalid attempts, 15 min reset (ACSC / CIS 1.2.x)'
+}
+
+# --- Advanced audit policy (CIS 17.x, DISA STIG WN11-AU-*) ---
+$auditPolFile = Join-Path $Root 'AuditPolBackup.pol'
+if (-not (Test-Path $auditPolFile)) {
+    auditpol /backup /file:$auditPolFile | Out-Null
+    if (Test-Path $auditPolFile) { if ($null -eq $Backup.AuditPolFile) { $Backup.AuditPolFile = $auditPolFile } }
+    else { Write-Log '  WARN: could not back up audit policy - audit subcategories NOT set' }
+}
+if (Test-Path $auditPolFile) {
+    Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1
+    $auditOnBoth = @('Logon','Credential Validation','User Account Management','Other System Events','System Integrity','Removable Storage')
+    $auditSuccess = @('Logoff','Process Creation','Audit Policy Change','Security State Change','Special Logon')
+    $auditFailures = 0
+    foreach ($c in $auditOnBoth) { auditpol /set /subcategory:$c /success:enable /failure:enable  | Out-Null; if ($LASTEXITCODE -ne 0) { $auditFailures++ } }
+    foreach ($c in $auditSuccess) { auditpol /set /subcategory:$c /success:enable /failure:disable | Out-Null; if ($LASTEXITCODE -ne 0) { $auditFailures++ } }
+    auditpol /set /subcategory:'Account Lockout' /success:disable /failure:enable | Out-Null
+    if ($LASTEXITCODE -ne 0) { $auditFailures++ }
+    if ($auditFailures -eq 0) { Write-Log '  audit policy: key subcategories enabled (logon, credential validation, policy change, integrity)' }
+    else { Write-Log "  WARN: $auditFailures auditpol call(s) failed - check transcript" }
+}
+
+# --- Firewall logging (CIS 9.x; SANS) ---
+$fwProfiles = Get-NetFirewallProfile -Profile Domain,Public,Private -EA SilentlyContinue
+if ($fwProfiles -and $Backup.FirewallLog -is [System.Collections.IDictionary] -and $Backup.FirewallLog.Count -eq 0) {
+    foreach ($p in $fwProfiles) {
+        $Backup.FirewallLog[$p.Name] = [ordered]@{ LogBlocked=$p.LogBlocked; LogAllowed=$p.LogAllowed; LogMaxSizeKilobytes=$p.LogMaxSizeKilobytes }
+    }
+}
+Set-NetFirewallProfile -Profile Domain,Public,Private -LogBlocked True -LogAllowed True -LogMaxSizeKilobytes 16384 -EA SilentlyContinue
+Write-Log '  firewall logging enabled (blocked + allowed connections, 16 MB log)'
+
+# --- VBS / Memory Integrity / Credential Guard (ACSC, NSA, CIS 18.9.5.x, STIG) ---
+# Requires CPU virtualization, TPM and Secure Boot; becomes active after the
+# next reboot. UEFI-locked per ACSC, so disablement needs the Core isolation UI.
+$vbsOk = $false
+try {
+    $cpuInfo = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+    $tpmInfo = Get-Tpm -ErrorAction SilentlyContinue
+    $sbInfo  = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+    if ($cpuInfo.VirtualizationFirmwareEnabled -and $tpmInfo.TpmPresent -and $sbInfo) { $vbsOk = $true }
+    else { Write-Log ("  SKIP VBS: hardware missing (cpu-virt=" + $cpuInfo.VirtualizationFirmwareEnabled + " tpm=" + $tpmInfo.TpmPresent + " secureboot=" + $sbInfo + ")") }
+} catch { Write-Log '  SKIP VBS: could not verify hardware support' }
+if ($vbsOk) {
+    Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\DeviceGuard' 'EnableVirtualizationBasedSecurity' 1
+    Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\DeviceGuard' 'RequirePlatformSecurityFeatures' 1
+    Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\DeviceGuard' 'Locked' 1
+    Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'Enabled' 1
+    Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard' 'Enabled' 1
+    Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 1
+    Write-Log '  VBS + Memory Integrity + Credential Guard enabled (UEFI-locked; active after reboot)'
+    Write-Log '  NOTE: check Windows Security > Device security after reboot for incompatible drivers'
+}
+Write-Log '  defense-in-depth settings applied'
 
 # ---------------------------------------------------------------- 5. file cleanup
 if (-not $SkipCleanup) {

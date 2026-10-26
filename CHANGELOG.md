@@ -9,7 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- New defense-in-depth section (4c) in Harden-Windows.ps1, sourced from
+  CIS, ACSC, NSA/CISA, CCCS ITSP.70.012, and DISA STIG:
+  - PowerShell module logging, transcription (to
+    C:\Windows\Logs\PSTranscripts), and PowerShell v2 engine removal.
+  - Exploit Protection system defaults (DEP, SEHOP, CFG, mandatory/bottom-up
+    ASLR, handle validation, extension-point blocking).
+  - Controlled Folder Access in Block mode, with powershell.exe and pwsh.exe
+    allow-listed so the local admin's scripts still write to protected folders.
+  - Tamper Protection and real-time protection status reporting.
+  - Credential hardening: DisableDomainCreds, LimitBlankPasswordUse,
+    RestrictNullSessAccess, cleared NullSessionPipes/Shares, SafeDllSearchMode,
+    DontDisplayLastUserName, AutoAdminLogon off, Guest account disabled.
+  - Account lockout (5 attempts / 15 min) with secedit export for restore.
+  - Advanced audit policy subcategories with auditpol /backup for restore.
+  - Firewall logging (blocked + allowed connections, 16 MB).
+  - VBS, Memory Integrity (HVCI), and Credential Guard with UEFI lock,
+    applied only when CPU virtualization + TPM + Secure Boot are present.
+  - mDNS disabled (CIS 18.6.4.1) alongside LLMNR/NetBIOS.
+- references.md documenting every change, its source baseline, and the
+  "could have gone further but it would break a requirement" decisions.
+
 ### Changed
+
+- Defender state is now captured once by a shared helper and includes
+  Controlled Folder Access and scheduled-scan settings; Undo restores them.
+- Undo-Hardening.ps1 restores the new 4c items (PSv2 feature, PowerShell log
+  size, transcript ACL, guest account, security policy, audit policy,
+  firewall logging) and decodes base64 binary registry data on restore.
 
 ### Deprecated
 
@@ -18,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 ### Security
+
+- ScriptBlockLogging now pairs with module logging and transcription so
+  PowerShell activity is fully recorded (NSA/CISA 2022, CCCS ITSP.70.012).
+- VBS/Memory Integrity/Credential Guard add kernel- and credential-isolation
+  defenses that no registry-only hardening can provide (ACSC, NSA, CIS, STIG).
 
 ## [0.1.0] - 2026-10-26
 

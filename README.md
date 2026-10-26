@@ -39,9 +39,11 @@ powershell -ExecutionPolicy Bypass -File .\Undo-Hardening.ps1
 
 | Script | Purpose |
 | --- | --- |
-| `Harden-Windows.ps1` | The main hardening pass: registry policies, services, scheduled tasks, Appx removal, network hardening, cleanup. Backs up every original setting to `HardenBackup.json` first, and installs TelemetryGuard. |
+| `Harden-Windows.ps1` | The main hardening pass: registry policies, services, scheduled tasks, Appx removal, network hardening, cleanup, plus a defense-in-depth layer from CIS/ACSC/NSA/STIG baselines (PowerShell deep logging, Exploit Protection, Controlled Folder Access, credential hardening, account lockout, audit policy, firewall logging, VBS/Credential Guard where hardware allows). Backs up every original setting to `HardenBackup.json` first, and installs TelemetryGuard. |
 | `TelemetryGuard.ps1` | Installed by the main script to run at logon. Silent when the system is clean; re-applies telemetry hardening when Windows Update has restored it. |
-| `Undo-Hardening.ps1` | Full revert using `HardenBackup.json`: restores registry values, services, scheduled tasks, removed Appx packages, Defender ASR rules, execution policy, firewall defaults, and removes TelemetryGuard. |
+| `Undo-Hardening.ps1` | Full revert using `HardenBackup.json`: restores registry values, services, scheduled tasks, removed Appx packages, Defender ASR rules, execution policy, firewall defaults, audit/lockout policies, and removes TelemetryGuard. |
+
+Every change - and the "we could have gone further but it would have broken a requirement" calls - is documented with sources in [references.md](./references.md).
 
 ## Configuration
 
@@ -63,6 +65,9 @@ powershell -ExecutionPolicy Bypass -File .\Harden-Windows.ps1 -SkipServices -Ski
 
 - `Harden-Windows.ps1` and `Undo-Hardening.ps1` write a transcript log next to the script (`Harden-<timestamp>.log`, `Undo-<timestamp>.log`) and print an error summary when finishing. Attach that log when reporting a problem.
 - `TelemetryGuard.ps1` appends to `TelemetryGuard.log` in `%LOCALAPPDATA%\TelemetryGuard`.
+- **Reboot required** for the VBS/Memory Integrity/Credential Guard layer to activate. After rebooting, check Windows Security > Device security > Core isolation for incompatible-driver warnings. If your VPN or other kernel driver stops loading, undo the VBS layer there (the registry restore in `Undo-Hardening.ps1` alone cannot clear the UEFI lock).
+- PowerShell transcripts are written to `C:\Windows\Logs\PSTranscripts`. Keep that folder admin-only: it records everything typed into PowerShell.
+- Windows will no longer save network/domain credentials (`net use /savecred`, RDP saved passwords) after hardening - that is intentional (`DisableDomainCreds`); use a password manager instead.
 - Exit codes: `0` success, `1` aborted or a failure that needs attention (e.g. backup could not be saved, TelemetryGuard task could not be registered).
 
 ## Development
