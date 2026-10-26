@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-26
+
 ### Added
 
 - New defense-in-depth section (4c) in Harden-Windows.ps1, sourced from
@@ -37,12 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Undo-Hardening.ps1 restores the new 4c items (PSv2 feature, PowerShell log
   size, transcript ACL, guest account, security policy, audit policy,
   firewall logging) and decodes base64 binary registry data on restore.
-
-### Deprecated
-
-### Removed
-
-### Fixed
 
 ### Security
 
