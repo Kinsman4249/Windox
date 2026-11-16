@@ -3,7 +3,8 @@
 .SYNOPSIS
   Windows hardening / debloat / telemetry-kill script.
   Tailored for Windows 10/11 Pro in hostile or enterprise environments.
-  Keeps working: Microsoft Store, Quick Assist, Proton Drive, printing, VPN, Windows Update, Defender.
+  Keeps working: Microsoft Store, Quick Assist, Proton Drive, printing, VPN, Windows Update, Defender,
+  OneDrive, Microsoft 365 Apps, Intune/MDM sync (unless -Aggressive).
   Creates/uses HardenBackup.json in the script folder for full undo (Undo-Hardening.ps1).
   Installs TelemetryGuard.ps1 as an elevated scheduled task that runs at logon
   (re-applies telemetry hardening after Windows updates, only elevating when drift is detected).
@@ -21,7 +22,9 @@ param(
     [switch]$SkipAppx,
     [switch]$SkipNetwork,
     [switch]$SkipCleanup,
-    [switch]$NoConfirm   # skips the interactive safety confirmation (scripted installs)
+    [switch]$NoConfirm,  # skips the interactive safety confirmation (scripted installs)
+    [switch]$Aggressive  # unmanaged/personal devices only: blocks OneDrive sync, push notifications,
+                         # MDM push (dmwappushservice), Office connected experiences, removes Store M365 apps
 )
 
 # 'Continue' instead of 'SilentlyContinue': unexpected failures now print and
@@ -258,11 +261,45 @@ Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'ConnectedSear
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\Device Metadata' 'PreventDeviceMetadataFromNetwork' 1
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\System' 'EnableFontProviders' 0
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\PreviewBuilds' 'AllowBuildPreview' 0
-Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\PushNotifications' 'NoCloudApplicationNotification' 1
+# NoCloudApplicationNotification: default mode leaves WNS push on (Teams/Outlook/OneDrive
+# notifications, Intune/MDM sync triggers). -Aggressive blocks it below.
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows Mail' 'ManualLaunchAllowed' 0
-Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator' 'NoActiveProbe' 1
-Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator' 'DisablePassivePolling' 1
-Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC' 1
+# NCSI probes and OneDrive are intentionally left at Windows defaults:
+#  - Outlook, Teams, OneDrive, Office activation and Windows Update use NCSI status;
+#    disabling probes makes them report offline (Microsoft: "Don't disable active probing").
+#  - OneDrive sync (DisableFileSyncNGSC) stays allowed unless -Aggressive.
+# Clear these values if a previous version of this script set them (undo still removes them).
+# In -Aggressive mode the OneDrive/push entries are skipped here and enforced below.
+$defaultOnly = @(
+    @{P='SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator';N='NoActiveProbe'},
+    @{P='SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator';N='DisablePassivePolling'})
+if (-not $Aggressive) { $defaultOnly += @(
+    @{P='SOFTWARE\Policies\Microsoft\Windows\OneDrive';N='DisableFileSyncNGSC'},
+    @{P='SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\PushNotifications';N='NoCloudApplicationNotification'}) }
+foreach ($kv in $defaultOnly) {
+    if (Get-ItemProperty "HKLM:\$($kv.P)" -Name $kv.N -EA SilentlyContinue) {
+        Remove-ItemProperty "HKLM:\$($kv.P)" -Name $kv.N -EA SilentlyContinue
+        Write-Log "  restored default (removed policy): $($kv.N)"
+    }
+}
+# Office diagnostic data: 3 = Neither. Default mode leaves connected experiences on.
+Set-Reg HKCU 'Software\Policies\Microsoft\office\common\clienttelemetry' 'SendTelemetry' 3
+if ($Aggressive) {
+    Write-Log '  AGGRESSIVE: blocking OneDrive sync, WNS push, Office connected experiences'
+    # OneDrive sync client blocked (existing files stay on disk; sync stops).
+    Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC' 1
+    # Cloud push notifications blocked (Teams/Outlook toasts, MDM push wake-up).
+    Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\PushNotifications' 'NoCloudApplicationNotification' 1
+    # Office connected experiences: 2 = disabled. DisconnectedState=2 also disables AutoSave,
+    # co-authoring, OneDrive/SharePoint file integration and online templates in Office.
+    $op = 'Software\Policies\Microsoft\office\16.0\common\privacy'
+    Set-Reg HKCU $op 'DisconnectedState' 2
+    Set-Reg HKCU $op 'UserContentDisabled' 2
+    Set-Reg HKCU $op 'DownloadContentDisabled' 2
+    Set-Reg HKCU $op 'ControllerConnectedServicesEnabled' 2
+}
+# Microsoft vulnerable driver blocklist (on by default with HVCI; explicit for non-HVCI hardware).
+Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\CI\Config' 'VulnerableDriverBlocklistEnable' 1
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\SettingSync' 'DisableSettingSync' 2
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\SettingSync' 'DisableSettingSyncUserOverride' 1
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\System' 'AllowCrossDeviceClipboard' 0
@@ -279,7 +316,16 @@ Set-Reg HKLM 'SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisabledComp
 # Error reporting + services
 Set-Reg HKLM 'SOFTWARE\Microsoft\Windows\Windows Error Reporting' 'Disabled' 1
 Disable-ServiceSafe 'DiagTrack'
-Disable-ServiceSafe 'dmwappushservice'
+# dmwappushservice = WAP push routing used by Intune/MDM sync. Default: keep enabled.
+if ($Aggressive) { Disable-ServiceSafe 'dmwappushservice' }
+else {
+    # Re-enable if a previous version of this script disabled it (3 = Manual, Windows default).
+    $wap = Get-Service dmwappushservice -EA SilentlyContinue
+    if ($wap -and $wap.StartType -eq 'Disabled') {
+        Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\dmwappushservice' -Name Start -Value 3
+        Write-Log '  service re-enabled (Manual): dmwappushservice'
+    }
+}
 Disable-ServiceSafe 'WerSvc'
 
 # Telemetry scheduled tasks
@@ -323,7 +369,8 @@ if (-not $SkipServices) {
                'XblAuthManager','XblGameSave','XboxNetApiSvc','XboxGipSvc','SEMgrSvc','wisvc',
                'TrkWks','SysMain','WpcMonSvc','SSDPSRV','upnphost','WinRM','SmsRouter','WalletService',
                'MessagingService','PimIndexMaintenanceSvc','PcaSvc',
-               'whesvc','WSAIFabricSvc','InventorySvc','SensorService','wcncsvc','lmhosts','LicenseManager'
+               'whesvc','WSAIFabricSvc','InventorySvc','SensorService','wcncsvc','lmhosts'
+    # LicenseManager intentionally kept: Store app licensing (Store-delivered Office/Teams/To Do).
     foreach ($s in $svcList) { Disable-ServiceSafe $s }
     # Per-user service families (disable template + live _xxxx instances)
     foreach ($f in 'MessagingService','PimIndexMaintenanceSvc','cbdhsvc','DevicesFlowUserSvc','CloudBackupRestoreSvc') {
@@ -333,12 +380,22 @@ if (-not $SkipServices) {
     Set-ServiceManualSafe 'DoSvc'
 }
 
+# ---------------------------------------------------------------- 2b. Store / Quick Assist health check
+# Runs in every mode (including -Aggressive). Read-only: logs a WARN if anything the Store
+# or Quick Assist depends on is disabled, so it shows up in the error summary/log.
+foreach ($svc in 'InstallService','wlidsvc','ClipSVC','TokenBroker','AppXSvc','camsvc','DoSvc','LicenseManager') {
+    $o = Get-Service $svc -EA SilentlyContinue
+    if ($o -and $o.StartType -eq 'Disabled') { Write-Log "  WARN: Store dependency disabled: $svc" }
+}
+foreach ($pkg in 'Microsoft.WindowsStore','MicrosoftCorporationII.QuickAssist','Microsoft.AAD.BrokerPlugin') {
+    if (-not (Get-AppxPackage -AllUsers -Name $pkg -EA SilentlyContinue)) { Write-Log "  WARN: package not present: $pkg" }
+}
 # ---------------------------------------------------------------- 3. appx bloat
 if (-not $SkipAppx) {
     Write-Log '== 3. Removing consumer app bundles (Store / Quick Assist / Proton / media kept) =='
     $kill = @(
         'Microsoft.BingNews','Microsoft.BingSearch','Microsoft.BingWeather','Microsoft.BingFinance',
-        'Microsoft.GamingApp','Microsoft.GetHelp','Microsoft.Getstarted','Microsoft.Todos',
+        'Microsoft.GamingApp','Microsoft.GetHelp','Microsoft.Getstarted',
         'Microsoft.PowerAutomateDesktop','Microsoft.WidgetsPlatformRuntime','Microsoft.WindowsFeedbackHub',
         'Microsoft.Windows.DevHome','Microsoft.Xbox.TCUI','Microsoft.XboxGameCallableUI',
         'Microsoft.XboxGamingOverlay','Microsoft.XboxIdentityProvider','Microsoft.XboxSpeechToTextOverlay',
@@ -347,7 +404,15 @@ if (-not $SkipAppx) {
         'Microsoft.ConnectedWidgetsPlatformRuntime','Microsoft.Copilot'
     )
     # hard protections: never touch these
-    $protect = 'QuickAssist','WindowsStore','StorePurchaseApp','DesktopAppInstaller','SecHealthUI','ProtonDrive','NotepadPlusPlus'
+    $protect = 'QuickAssist','WindowsStore','StorePurchaseApp','DesktopAppInstaller','SecHealthUI','ProtonDrive','NotepadPlusPlus',
+                'AAD.BrokerPlugin'   # work/school account sign-in broker: always kept
+    $m365Apps = 'Microsoft.Todos','Microsoft.MicrosoftOfficeHub','Microsoft.OutlookForWindows','MSTeams','Microsoft.Office.OneNote','Microsoft.OneDriveSync'
+    if ($Aggressive) {
+        Write-Log '  AGGRESSIVE: removing Store-delivered M365 apps (To Do, M365 hub, new Outlook, Teams, OneNote)'
+        $kill += $m365Apps
+    } else {
+        $protect += 'Todos','OneDrive','MicrosoftOfficeHub','OutlookForWindows','MSTeams','MicrosoftTeams','Office.OneNote'
+    }
     foreach ($name in $kill) {
         if ($protect | Where-Object { $name -like "*$_*" }) { continue }
         $pkgs = Get-AppxPackage -Name $name -AllUsers
@@ -410,26 +475,39 @@ if (-not $SkipNetwork) {
     Backup-DefenderState
     $asr = Get-MpPreference
     # id -> action: 1 = block, 2 = audit
+    # GUIDs verified against Microsoft Learn "ASR rules reference".
+    # id -> action: 1 = block, 2 = audit. Rules that commonly break line-of-business
+    # software, RMM agents, or Office add-ins are audit-only (review Event ID 1121/1122).
     $asrMap = [ordered]@{
-        '7674ba52-37eb-4664-abf5-4c0f867f5ccc' = 1  # Office child processes
-        'd4f940ab-401b-4efc-aadc-ad5f3c729774' = 1  # Office macro Win32 API
-        'a8f58c8b-6a40-4566-a874-9c99a1a43a53' = 1  # Office code injection
-        '3b576869-a4ec-4529-8536-b80a7769e899' = 1  # Office executable content
-        '5beb7efe-fd9a-4556-801d-275e5ffc04cc' = 1  # Office loader validation
-        '01443614-cd74-433a-b99e-2ecdc07bfc25' = 1  # email exploit
-        'd3e037e1-3eb8-44c8-a917-57927947596d' = 1  # JS/VBS downloader
-        '92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b' = 1  # obfuscated code
-        '9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2' = 1  # LSASS credential access
-        'c1db55ab-c21a-4637-bb3f-a12568109d35' = 1  # ransomware
-        'b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4' = 1  # USB untrusted process
-        'd1e49aac-8f56-4280-b9ba-993a6d77406c' = 1  # Adobe Reader child proc
-        'be9ba2d9-53ea-4cdc-84e5-9b1eeee46550' = 2  # PSExec/WMI (audit, MS baseline)
+        '56a863a9-875e-4185-98a7-b882c64b5ce5' = 1  # vulnerable signed drivers (MS standard protection)
+        '9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2' = 1  # LSASS credential stealing (MS standard protection)
+        'e6db77e5-3df2-4cf1-b95a-636979351e5b' = 1  # WMI event subscription persistence (MS standard protection)
+        'd4f940ab-401b-4efc-aadc-ad5f3c50688a' = 1  # Office apps creating child processes
+        '3b576869-a4ec-4529-8536-b80a7769e899' = 1  # Office apps creating executable content
+        '75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84' = 1  # Office apps injecting into other processes
+        '92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b' = 1  # Win32 API calls from Office macros
+        '26190899-1602-49e8-8b27-eb1d0a1ce869' = 1  # Office communication app (Outlook) child processes
+        'be9ba2d9-53ea-4cdc-84e5-9b1eeee46550' = 1  # executable content from email/webmail
+        'd3e037e1-3eb8-44c8-a917-57927947596d' = 1  # JS/VBS launching downloaded executables
+        '5beb7efe-fd9a-4556-801d-275e5ffc04cc' = 1  # potentially obfuscated scripts
+        'b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4' = 1  # untrusted/unsigned processes from USB
+        '7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c' = 1  # Adobe Reader child processes
+        'c1db55ab-c21a-4637-bb3f-a12568109d35' = 1  # advanced ransomware protection
+        '01443614-cd74-433a-b99e-2ecdc07bfc25' = 2  # prevalence/age/trusted-list (AUDIT: blocks new/rare installers)
+        'd1e49aac-8f56-4280-b9ba-993a6d77406c' = 2  # PSExec/WMI process creation (AUDIT: breaks RMM/ConfigMgr)
     }
+    # Invalid GUIDs written by earlier versions of this script; purged so they do not persist.
+    $asrBad = @('7674ba52-37eb-4664-abf5-4c0f867f5ccc','d4f940ab-401b-4efc-aadc-ad5f3c729774','a8f58c8b-6a40-4566-a874-9c99a1a43a53')
     $ids = @(); $acts = @()
-    foreach ($id in ($asrMap.Keys + @($asr.AttackSurfaceReductionRules_Ids | ForEach-Object { "$_".Trim('{}') }) | Sort-Object -Unique)) {
+    foreach ($id in ($asrMap.Keys + @($asr.AttackSurfaceReductionRules_Ids | ForEach-Object { "$_".Trim('{}').ToLower() }) | Where-Object { $_ -and $asrBad -notcontains $_ } | Sort-Object -Unique)) {
         $ids += $id
-        if ($asrMap.Contains($id)) { $acts += $asrMap[$id] } else { $acts += 1 }
+        if ($asrMap.Contains($id)) { $acts += $asrMap[$id] } else {
+            # Pre-existing rule not managed here: keep its current action instead of forcing Block.
+            $i = [array]::IndexOf(@($asr.AttackSurfaceReductionRules_Ids | ForEach-Object { "$_".Trim('{}').ToLower() }), $id)
+            $acts += $(if ($i -ge 0) { @($asr.AttackSurfaceReductionRules_Actions)[$i] } else { 2 })
+        }
     }
+    if ($asrBad | Where-Object { @($asr.AttackSurfaceReductionRules_Ids) -contains $_ }) { Remove-MpPreference -AttackSurfaceReductionRules_Ids ($asrBad | Where-Object { @($asr.AttackSurfaceReductionRules_Ids) -contains $_ }) -EA SilentlyContinue }
     Set-MpPreference -AttackSurfaceReductionRules_Ids $ids -AttackSurfaceReductionRules_Actions $acts
     Set-MpPreference -CloudBlockLevel High
     Set-MpPreference -CloudExtendedTimeout 50
@@ -448,7 +526,7 @@ if (-not $SkipNetwork) {
 Write-Log '== 4b. Intune security baseline (local equivalents) =='
 # MS Security Guide
 Set-Reg HKLM 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'LocalAccountTokenFilterPolicy' 0   # UAC restrict local accounts on network logon
-Set-Reg HKLM 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\*' 'DisableExceptionChainValidation' 0  # SEHOP
+Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'DisableExceptionChainValidation' 0  # SEHOP (correct key per MS Security Guide)
 Set-Reg HKLM 'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'DisableIPSourceRouting' 2
 Set-Reg HKLM 'SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisableIPSourceRouting' 2
 Set-Reg HKLM 'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' 'EnableICMPRedirect' 0
@@ -695,6 +773,12 @@ if ($vbsOk) {
     Write-Log '  NOTE: check Windows Security > Device security after reboot for incompatible drivers'
 }
 Write-Log '  defense-in-depth settings applied'
+# --- BitLocker: report only (encryption needs key escrow planning; not auto-enabled) ---
+if (Get-Command Get-BitLockerVolume -EA SilentlyContinue) {
+    $blv = Get-BitLockerVolume -MountPoint $env:SystemDrive -EA SilentlyContinue
+    if ($blv) { Write-Log ("  BitLocker $($env:SystemDrive): " + $blv.ProtectionStatus + " / " + $blv.VolumeStatus) }
+    if ($blv -and $blv.ProtectionStatus -ne 'On') { Write-Log '  WARN: OS drive not BitLocker-protected - enable with recovery key escrowed to Entra/AD' }
+}
 
 # ---------------------------------------------------------------- 5. file cleanup
 if (-not $SkipCleanup) {
@@ -739,7 +823,7 @@ foreach ($f in 'TelemetryGuard.lnk','TelemetryGuard.ps1','TelemetryGuard.log') {
 
 # Register an elevated, hidden, at-logon task (no UAC prompt, no Notepad issue)
 try {
-    $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $guardDst + '"'
+    $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $guardDst + '"' + $(if ($Aggressive) { ' -Aggressive' } else { '' }))
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest

@@ -1,7 +1,7 @@
 # Windox
 
 Windows hardening, debloat, and telemetry removal scripts for Windows 10/11 Pro.
-Kills telemetry, disables tracking services, removes bloat, and hardens defaults - while keeping things that should keep working: the Microsoft Store, Quick Assist, printing, VPN, Windows Update, and Defender.
+Kills telemetry, disables tracking services, removes bloat, and hardens defaults - while keeping things that should keep working: the Microsoft Store, OneDrive, Microsoft 365 Apps (Office, Outlook, Teams, To Do), Quick Assist, printing, VPN, Windows Update, and Defender.
 
 ## Install
 
@@ -58,6 +58,7 @@ powershell -ExecutionPolicy Bypass -File .\Harden-Windows.ps1 -SkipServices -Ski
 - `-SkipNetwork` - leave network hardening alone
 - `-SkipCleanup` - skip cleanup steps
 - `-NoConfirm` - skip the interactive safety confirmation (scripted installs)
+- `-Aggressive` - unmanaged/personal devices only. Also blocks OneDrive sync, cloud push notifications, and the MDM push service (`dmwappushservice` - breaks Intune sync), disables Office connected experiences (AutoSave, co-authoring, online templates), and removes Store-delivered To Do, Microsoft 365 hub, new Outlook, Teams, and OneNote. TelemetryGuard re-enforces the OneDrive/push/MDM-push settings in this mode. Without it, OneDrive, Office cloud features, and Intune sync stay at Windows defaults.
 
 `Undo-Hardening.ps1` accepts `-KeepTelemetryGuard` to revert the hardening but leave the telemetry guard in place.
 

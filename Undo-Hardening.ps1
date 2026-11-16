@@ -109,8 +109,8 @@ if ($null -ne $Backup.ExecutionPol -and $Backup.ExecutionPol -ne '') {
 }
 
 # ---------------------------------------------------------------- firewall
-Write-Log '== Restoring firewall defaults (allow inbound) =='
-Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Allow -DefaultOutboundAction Allow
+Write-Log '== Restoring firewall defaults (Windows default: block inbound) =='
+Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction NotConfigured -DefaultOutboundAction NotConfigured
 
 # ---------------------------------------------------------------- defense-in-depth (section 4c)
 Write-Log '== Restoring defense-in-depth settings =='

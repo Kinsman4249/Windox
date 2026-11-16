@@ -6,6 +6,8 @@
   Windows Update has re-enabled telemetry.
 #>
 
+# -Aggressive is passed by the scheduled task when Harden-Windows.ps1 ran with -Aggressive.
+param([switch]$Aggressive)
 $ErrorActionPreference = 'SilentlyContinue'
 $guardDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $logFile  = Join-Path $guardDir 'TelemetryGuard.log'
@@ -81,19 +83,24 @@ $reg = @(
     @{P='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search';                                                  N='AllowCortana';                  V=0},
     @{P='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search';                                                  N='DisableWebSearch';              V=1},
     @{P='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search';                                                  N='ConnectedSearchUseWeb';         V=0},
-    @{P='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\PushNotifications';                                N='NoCloudApplicationNotification';V=1},
     @{P='HKLM:\SOFTWARE\Policies\Microsoft\Dsh';                                                                     N='AllowNewsAndInterests';         V=0},
     @{P='HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer';                                                        N='HideRecommendedSection';        V=1},
     @{P='HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\AutoLogger-Diagtrack-Listener';                        N='Start';                        V=0},
     @{P='HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\SQMLogger';                                            N='Start';                        V=0}
 )
+if ($Aggressive) {
+    $reg += @{P='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\PushNotifications'; N='NoCloudApplicationNotification'; V=1}
+    $reg += @{P='HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'; N='DisableFileSyncNGSC'; V=1}
+}
 foreach ($r in $reg) {
     if (-not (Test-Path $r.P)) { New-Item -Path $r.P -Force | Out-Null }
     Set-ItemProperty -Path $r.P -Name $r.N -Value $r.V -Type DWord
 }
 
 # Services
-foreach ($s in 'DiagTrack','dmwappushservice') {
+# dmwappushservice (Intune/MDM push) only in aggressive mode.
+$guardSvcs = @('DiagTrack'); if ($Aggressive) { $guardSvcs += 'dmwappushservice' }
+foreach ($s in $guardSvcs) {
     $sv = Get-Service $s -EA SilentlyContinue
     if ($sv) {
         if ($sv.Status -eq 'Running') { Stop-Service $s -Force -EA SilentlyContinue }
