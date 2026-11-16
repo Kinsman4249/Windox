@@ -23,6 +23,8 @@ param(
     [switch]$SkipNetwork,
     [switch]$SkipCleanup,
     [switch]$NoConfirm,  # skips the interactive safety confirmation (scripted installs)
+    [switch]$ForceDefenderSettings, # write Defender ASR/CFA/cloud settings even when a third-party AV
+                         # owns protection (they take effect if Defender becomes active again)
     [switch]$Aggressive  # unmanaged/personal devices only: blocks OneDrive sync, push notifications,
                          # MDM push (dmwappushservice), Office connected experiences, removes Store M365 apps
 )
@@ -36,6 +38,35 @@ $BackupFile = Join-Path $Root 'HardenBackup.json'
 
 # ---------------------------------------------------------------- helpers
 function Write-Log { param([string]$Msg) Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Msg) }
+
+# Non-fatal problem: logged in yellow and counted for the end-of-run summary.
+$script:WarnCount = 0
+function Write-Warn {
+    param([string]$Msg)
+    # Tag access-denied style failures when a third-party AV is installed (possible culprit).
+    if ($script:ThirdPartyAV -and $Msg -match 'denied|could not set|could not be removed|not removed') { $Msg += ' [third-party AV may be blocking]' }
+    $script:WarnCount++
+    Write-Host ("[{0}]   WARN: {1}" -f (Get-Date -Format 'HH:mm:ss'), $Msg) -ForegroundColor Yellow
+}
+
+# Runs one command as SYSTEM through a temporary scheduled task, waits up to 30 s,
+# returns the exit code (-1 if the task itself could not run). Used as a fallback for
+# registry keys / scheduled tasks whose ACL denies Administrators but allows SYSTEM.
+# The temporary task is always deleted.
+function Invoke-AsSystem {
+    param([string]$Exe,[string]$Arguments)
+    $tn = 'Windox-Elevate-' + [guid]::NewGuid().ToString('N').Substring(0,8)
+    try {
+        $a = New-ScheduledTaskAction -Execute $Exe -Argument $Arguments
+        $p = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName $tn -Action $a -Principal $p -Force -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $tn -ErrorAction Stop
+        $deadline = (Get-Date).AddSeconds(30)
+        do { Start-Sleep -Milliseconds 500 } while ((Get-ScheduledTask -TaskName $tn).State -eq 'Running' -and (Get-Date) -lt $deadline)
+        return [int](Get-ScheduledTaskInfo -TaskName $tn).LastTaskResult
+    } catch { return -1 }
+    finally { Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue }
+}
 
 # ---------------------------------------------------------------- safety gate
 # Runs interactively before anything is changed. Skippable with -NoConfirm
@@ -56,8 +87,29 @@ if (-not $NoConfirm) {
 # Captures every log line and error record for troubleshooting. Share this
 # file when reporting a problem.
 $LogPath = Join-Path $Root ('Harden-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
-try { Start-Transcript -Path $LogPath -Force | Out-Null } catch { $LogPath = $null; Write-Log 'WARN: could not start transcript logging.' }
+try { Start-Transcript -Path $LogPath -Force | Out-Null } catch { $LogPath = $null; Write-Warn 'could not start transcript logging.' }
 Write-Log '== Windox hardening starting =='
+
+# ---------------------------------------------------------------- 0. AV detection
+# Security Center (workstations only) lists registered AV products. productState bits
+# 12-15 = 1 means real-time on. Defender's AMRunningMode tells us whether Defender is the
+# active engine (Normal) or stepped aside (Passive / SxS Passive / EDR Block / Not running).
+$ThirdPartyAV = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -EA SilentlyContinue |
+    Where-Object { $_.displayName -notlike '*Defender*' } |
+    ForEach-Object { [pscustomobject]@{ Name=$_.displayName; On=((($_.productState -shr 12) -band 0xF) -eq 1) } })
+$DefMode = (Get-MpComputerStatus -EA SilentlyContinue).AMRunningMode
+$DefenderActive = ($DefMode -eq 'Normal')
+if ($ThirdPartyAV) {
+    foreach ($a in $ThirdPartyAV) { Write-Log ("  third-party AV: " + $a.Name + " (real-time " + $(if ($a.On) {'ON'} else {'OFF'}) + ")") }
+    Write-Log ("  Microsoft Defender mode: " + $(if ($DefMode) { $DefMode } else { 'not reporting' }))
+    Write-Warn 'third-party AV present - its tamper/behaviour protection may block some registry, service, task or app changes; check its event log/console for blocks if WARN lines show access denied'
+} else {
+    Write-Log ("  no third-party AV registered; Defender mode: " + $(if ($DefMode) { $DefMode } else { 'not reporting' }))
+}
+# Defender settings (ASR, Network Protection, cloud, PUA, CFA, scan tuning) only run when
+# Defender is the active engine, unless -ForceDefenderSettings.
+$DoDefender = $DefenderActive -or $ForceDefenderSettings
+if (-not $DoDefender) { Write-Log '  Defender is not the active engine - Defender settings will be SKIPPED (use -ForceDefenderSettings to write them anyway)' }
 
 # Backup container ---------------------------------------------------------
 $Backup = [ordered]@{
@@ -78,7 +130,7 @@ $Backup = [ordered]@{
     FirewallLog  = @{}
 }
 if (Test-Path $BackupFile) {
-    try { $Backup = Get-Content $BackupFile -Raw | ConvertFrom-Json } catch { Write-Log "WARN: backup unreadable, starting fresh backup."; $Backup.Registry = @(); $Backup.Services = @(); $Backup.Tasks = @(); $Backup.Apps = @() }
+    try { $Backup = Get-Content $BackupFile -Raw | ConvertFrom-Json } catch { Write-Warn "backup unreadable, starting fresh backup."; $Backup.Registry = @(); $Backup.Services = @(); $Backup.Tasks = @(); $Backup.Apps = @() }
     foreach ($f in @('AuditPolFile','SecPolFile','PSv2','PSOpLogSize','TranscriptionDirCreated','GuestEnabled','FirewallLog')) {
         if ($null -eq $Backup.$f) { $Backup | Add-Member -NotePropertyName $f -NotePropertyValue ($(if ($f -eq 'TranscriptionDirCreated') { $false } elseif ($f -eq 'FirewallLog') { @{} } else { $null })) -Force }
     }
@@ -99,9 +151,15 @@ function Test-BackupHasReg { param($Hive,$Path,$Name)
 function Set-Reg {
     param([string]$Hive,[string]$Path,[string]$Name,$Value,[string]$Type='DWord')
     $key = $null
-    if ($Hive -eq 'HKLM') { $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($Path) }
-    else                  { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($Path) }
-    if (-not $key) { Write-Log "  SKIP reg $Hive\$Path\$Name"; return }
+    try {
+        if ($Hive -eq 'HKLM') { $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($Path) }
+        else                  { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($Path) }
+    } catch { $key = $null }
+    if (-not $key) {
+        # Key cannot even be opened writable as admin: try SYSTEM (HKLM only), else warn.
+        if ($Hive -eq 'HKLM' -and (Set-RegAsSystem $Path $Name $Value $Type)) { Write-Log "  reg set via SYSTEM: $Path\$Name"; return }
+        Write-Warn "registry access denied, not set: $Hive\$Path\$Name"; return
+    }
     $exists = $key.GetValueNames() -contains $Name
     if (-not (Test-BackupHasReg -Hive $Hive -Path $Path -Name $Name)) {
         $entry = [ordered]@{ Hive=$Hive; Path=$Path; Name=$Name; Existed=$exists }
@@ -111,8 +169,33 @@ function Set-Reg {
         }
         $Backup.Registry += (New-Object psobject -Property $entry)
     }
-    $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]$Type)
-    $key.Close()
+    try { $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]$Type) }
+    catch {
+        # Typical cause: key ACL owned by SYSTEM/TrustedInstaller. Retry as SYSTEM (HKLM only).
+        if ($Hive -eq 'HKLM' -and (Set-RegAsSystem $Path $Name $Value $Type)) { Write-Log "  reg set via SYSTEM: $Path\$Name" }
+        else { Write-Warn "registry access denied, not set: $Hive\$Path\$Name ($($_.Exception.GetBaseException().Message))" }
+    }
+    finally { $key.Close() }
+}
+
+# reg.exe add run as SYSTEM; returns $true on exit code 0. Supports DWord/QWord/String.
+function Set-RegAsSystem {
+    param([string]$Path,[string]$Name,$Value,[string]$Type)
+    $t = @{ DWord='REG_DWORD'; QWord='REG_QWORD'; String='REG_SZ'; ExpandString='REG_EXPAND_SZ' }[$Type]
+    if (-not $t) { return $false }
+    return ((Invoke-AsSystem 'reg.exe' "add `"HKLM\$Path`" /v `"$Name`" /t $t /d `"$Value`" /f") -eq 0)
+}
+
+# Sets a service Start value. Order: registry (fast) -> sc.exe via SCM (works when the
+# Services\<name> key ACL denies admins, e.g. TrkWks) -> WARN. Returns $true on success.
+function Set-ServiceStart {
+    param([string]$Name,[int]$Start)
+    try { Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name Start -Value $Start -ErrorAction Stop; return $true } catch {}
+    $mode = @{2='auto';3='demand';4='disabled'}[$Start]
+    & sc.exe config $Name start= $mode | Out-Null
+    if ($LASTEXITCODE -eq 0) { return $true }
+    Write-Warn "could not set start type of $Name (sc.exe exit $LASTEXITCODE)"
+    return $false
 }
 
 function Disable-ServiceSafe {
@@ -123,9 +206,8 @@ function Disable-ServiceSafe {
     if (-not $already) {
         $Backup.Services += (New-Object psobject -Property @{ Name=$Name; Start=(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name Start -EA SilentlyContinue).Start })
     }
-    if ($svc.Status -eq 'Running') { Stop-Service -Name $Name -Force -WarningAction SilentlyContinue }
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name Start -Value 4
-    Write-Log "  service disabled: $Name"
+    if ($svc.Status -eq 'Running') { Stop-Service -Name $Name -Force -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
+    if (Set-ServiceStart $Name 4) { Write-Log "  service disabled: $Name" }
 }
 
 # Disables a per-user (suffixed) service family: the template key and every live instance (_xxxx).
@@ -140,8 +222,7 @@ function Disable-ServiceFamily {
                 $Backup.Services += (New-Object psobject -Property @{ Name=$inst; Start=(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$inst" -Name Start -EA SilentlyContinue).Start })
             }
             Stop-Service -Name $inst -Force -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$inst" -Name Start -Value 4
-            Write-Log "  service disabled: $inst"
+            if (Set-ServiceStart $inst 4) { Write-Log "  service disabled: $inst" }
         }
 }
 
@@ -154,9 +235,8 @@ function Set-ServiceManualSafe {
     if (-not $already) {
         $Backup.Services += (New-Object psobject -Property @{ Name=$Name; Start=(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name Start -EA SilentlyContinue).Start })
     }
-    if ($svc.Status -eq 'Running') { Stop-Service -Name $Name -Force -WarningAction SilentlyContinue }
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name Start -Value 3
-    Write-Log "  service set to Manual: $Name"
+    if ($svc.Status -eq 'Running') { Stop-Service -Name $Name -Force -WarningAction SilentlyContinue -ErrorAction SilentlyContinue }
+    if (Set-ServiceStart $Name 3) { Write-Log "  service set to Manual: $Name" }
 }
 
 # Captures the current Defender state exactly once (used by the network section
@@ -322,8 +402,7 @@ else {
     # Re-enable if a previous version of this script disabled it (3 = Manual, Windows default).
     $wap = Get-Service dmwappushservice -EA SilentlyContinue
     if ($wap -and $wap.StartType -eq 'Disabled') {
-        Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\dmwappushservice' -Name Start -Value 3
-        Write-Log '  service re-enabled (Manual): dmwappushservice'
+        if (Set-ServiceStart 'dmwappushservice' 3) { Write-Log '  service re-enabled (Manual): dmwappushservice' }
     }
 }
 Disable-ServiceSafe 'WerSvc'
@@ -352,8 +431,15 @@ foreach ($t in $tasks) {
         if (-not (@($Backup.Tasks) | Where-Object { $_.Path -eq $t.P -and $_.Name -eq $t.N })) {
             $Backup.Tasks += (New-Object psobject -Property @{ Path=$t.P; Name=$t.N; State=$o.State })
         }
-        Disable-ScheduledTask -TaskPath $t.P -TaskName $t.N | Out-Null
-        Write-Log "  task disabled: $($t.N)"
+        if ($o.State -eq 'Disabled') { Write-Log "  task already disabled: $($t.N)"; continue }
+        try {
+            Disable-ScheduledTask -TaskPath $t.P -TaskName $t.N -ErrorAction Stop | Out-Null
+            Write-Log "  task disabled: $($t.N)"
+        } catch {
+            # Task ACL denies Administrators (SYSTEM-owned task): retry as SYSTEM.
+            if ((Invoke-AsSystem 'schtasks.exe' "/Change /TN `"$($t.P)$($t.N)`" /Disable") -eq 0) { Write-Log "  task disabled via SYSTEM: $($t.N)" }
+            else { Write-Warn "access denied disabling task (protected by Windows): $($t.P)$($t.N)" }
+        }
     }
 }
 
@@ -385,10 +471,10 @@ if (-not $SkipServices) {
 # or Quick Assist depends on is disabled, so it shows up in the error summary/log.
 foreach ($svc in 'InstallService','wlidsvc','ClipSVC','TokenBroker','AppXSvc','camsvc','DoSvc','LicenseManager') {
     $o = Get-Service $svc -EA SilentlyContinue
-    if ($o -and $o.StartType -eq 'Disabled') { Write-Log "  WARN: Store dependency disabled: $svc" }
+    if ($o -and $o.StartType -eq 'Disabled') { Write-Warn "Store dependency disabled: $svc" }
 }
 foreach ($pkg in 'Microsoft.WindowsStore','MicrosoftCorporationII.QuickAssist','Microsoft.AAD.BrokerPlugin') {
-    if (-not (Get-AppxPackage -AllUsers -Name $pkg -EA SilentlyContinue)) { Write-Log "  WARN: package not present: $pkg" }
+    if (-not (Get-AppxPackage -AllUsers -Name $pkg -EA SilentlyContinue)) { Write-Warn "package not present: $pkg" }
 }
 # ---------------------------------------------------------------- 3. appx bloat
 if (-not $SkipAppx) {
@@ -420,11 +506,23 @@ if (-not $SkipAppx) {
             if (-not (@($Backup.Apps) | Where-Object { $_.FullName -eq $p.PackageFullName })) {
                 $Backup.Apps += (New-Object psobject -Property @{ Name=$name; FullName=$p.PackageFullName; Loc=$p.InstallLocation })
             }
-            Remove-AppxPackage -Package $p.PackageFullName -AllUsers | Out-Null
-            Write-Log "  removed appx: $name"
+            try {
+                Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop | Out-Null
+                Write-Log "  removed appx: $name"
+            } catch {
+                # 0x80073D19: package is staged for a signed-out profile; cannot remove until that profile loads.
+                $code = '0x{0:X8}' -f $_.Exception.HResult
+                Write-Warn "appx $name not removed for all users ($code) - re-run after reboot or after the other profile signs in"
+            }
         }
-        $prov = Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq $name
-        foreach ($pp in $prov) { Remove-AppxProvisionedPackage -Online -PackageName $pp.PackageName -ErrorAction SilentlyContinue | Out-Null }
+        $prov = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object DisplayName -eq $name
+        foreach ($pp in $prov) {
+            try { Remove-AppxProvisionedPackage -Online -PackageName $pp.PackageName -ErrorAction Stop | Out-Null }
+            catch {
+                # "Path not found": provisioning record exists but its payload is gone (already removed / serviced). Harmless.
+                Write-Warn "provisioned package $name could not be removed: $($_.Exception.Message.Trim())"
+            }
+        }
     }
 }
 
@@ -472,6 +570,7 @@ if (-not $SkipNetwork) {
     # Firewall: default-deny inbound
     Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow
     # Defender: MS-baseline cloud/PUA/network settings + full ASR set
+    if ($DoDefender) {
     Backup-DefenderState
     $asr = Get-MpPreference
     # id -> action: 1 = block, 2 = audit
@@ -513,6 +612,8 @@ if (-not $SkipNetwork) {
     Set-MpPreference -CloudExtendedTimeout 50
     Set-MpPreference -EnableNetworkProtection Enabled
     Set-MpPreference -PUAProtection Enabled
+    Write-Log '  Defender ASR / Network Protection / cloud / PUA applied'
+    } else { Write-Log '  SKIP Defender ASR / Network Protection / cloud / PUA (third-party AV active)' }
     # PowerShell hardening
     $Backup.ExecutionPol = (Get-ExecutionPolicy -Scope LocalMachine)
     Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned -Force
@@ -581,14 +682,14 @@ Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\Personalization' 'NoLockScreen
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen' 1
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\System' 'ShellSmartScreenLevel' 'Block' -Type String
 # Block SBP-2 (IEEE 1394 storage) device class - exfiltration vector
-$di = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions')
-if (-not (Test-BackupHasReg -Hive 'HKLM' -Path 'SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions' -Name 'DenyDeviceClasses')) {
-    $Backup.Registry += (New-Object psobject -Property @{ Hive='HKLM'; Path='SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions'; Name='DenyDeviceClasses'; Existed=($null -ne $di.GetValue('DenyDeviceClasses')) })
-}
-$di.SetValue('DenyDeviceClasses',1,[Microsoft.Win32.RegistryValueKind]::DWord)
-$di.SetValue('DenyDeviceClassesRetroactive',1,[Microsoft.Win32.RegistryValueKind]::DWord)
-$di.SetValue('DenyDeviceClassesList',@('{d48179be-ec20-11d1-b6b8-00c04fa372a7}'),[Microsoft.Win32.RegistryValueKind]::MultiString)
-$di.Close()
+# Policy layout (DeviceInstallation.admx): DenyDeviceClasses=1 enables it; the class GUIDs are
+# REG_SZ values named 1,2,... under the DenyDeviceClasses subkey. All via Set-Reg so undo restores them.
+$dr = 'SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions'
+Set-Reg HKLM $dr 'DenyDeviceClasses' 1
+Set-Reg HKLM $dr 'DenyDeviceClassesRetroactive' 1
+Set-Reg HKLM "$dr\DenyDeviceClasses" '1' '{d48179be-ec20-11d1-b6b8-00c04fa372a7}' -Type String
+# Remove the invalid REG_MULTI_SZ value earlier versions tried to write (never valid policy).
+try { [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($dr,$true).DeleteValue('DenyDeviceClassesList',$false) } catch {}
 # Sudo disabled (Win11 24H2+)
 Set-Reg HKLM 'SOFTWARE\Policies\Microsoft\Windows\Sudo' 'Enabled' 0
 # Machine inactivity limit: lock after 15 min idle
@@ -651,22 +752,23 @@ if (Get-Command Set-ProcessMitigation -EA SilentlyContinue) {
     Set-ProcessMitigation -System -Enable DEP,EmulateAtlThunks,SEHOP,ForceRelocateImages,BottomUp,HighEntropy,StrictHandle,CFG,DisableExtensionPoints
     Write-Log '  Exploit Protection system defaults applied (DEP, SEHOP, CFG, ASLR, handle validation)'
 } else {
-    Write-Log '  WARN: Set-ProcessMitigation unavailable - Exploit Protection skipped'
+    Write-Warn 'Set-ProcessMitigation unavailable - Exploit Protection skipped'
 }
 
 # --- Controlled Folder Access (ACSC, CIS Defender benchmark, vendor ransomware guidance) ---
 # PowerShell/pwsh are allow-listed so the local admin's scripts can still write
 # to protected folders; every other untrusted write is blocked.
-Backup-DefenderState
+if ($DoDefender) { Backup-DefenderState }
 $cfaAllow = @("$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe")
 $pwshSrc = (Get-Command pwsh.exe -EA SilentlyContinue).Source
 if ($pwshSrc) { $cfaAllow += $pwshSrc }
-if (Get-Command Set-MpPreference -EA SilentlyContinue) {
+if (-not $DoDefender) { Write-Log '  SKIP Controlled Folder Access + Defender scan tuning (third-party AV active)' }
+elseif (Get-Command Set-MpPreference -EA SilentlyContinue) {
     try {
         Set-MpPreference -EnableControlledFolderAccess Enabled
         Set-MpPreference -ControlledFolderAccessAllowedApplications $cfaAllow
         Write-Log '  Controlled Folder Access: Block mode (powershell/pwsh allow-listed)'
-    } catch { Write-Log ("  WARN: Controlled Folder Access could not be enabled: " + $_.Exception.Message) }
+    } catch { Write-Warn ("Controlled Folder Access could not be enabled: " + $_.Exception.Message) }
     # Scheduled-scan optimization (MS Set-MpPreference docs): keep scans out of the way.
     try { Set-MpPreference -ScanAvgCPULoadFactor 30 } catch {}
     try { Set-MpPreference -EnableLowCpuPriority $true } catch {}
@@ -675,16 +777,21 @@ if (Get-Command Set-MpPreference -EA SilentlyContinue) {
 # Tamper Protection + real-time status: report, because Tamper Protection can
 # silently reject local changes to cloud-delivered protection settings.
 $mpStat = Get-MpComputerStatus -EA SilentlyContinue
-if ($mpStat) {
+if ($mpStat -and $DoDefender) {
     $tpVal = $null
     if ($null -ne $mpStat.IsTamperProtected) { $tpVal = $mpStat.IsTamperProtected }
     elseif ($null -ne $mpStat.TamperProtection) { $tpVal = ($mpStat.TamperProtection -match 'On|Enabled') }
     if ($tpVal -eq $true) {
         Write-Log '  Tamper Protection: ON (if any Set-MpPreference call reported an error, verify the affected value in Windows Security)'
     } elseif ($tpVal -eq $false) {
-        Write-Log '  WARN: Tamper Protection is OFF - enable it in Windows Security > Virus & threat protection > Settings'
+        Write-Warn 'Tamper Protection is OFF - enable it in Windows Security > Virus & threat protection > Settings'
     }
-    if (-not $mpStat.RealTimeProtectionEnabled) { Write-Log '  WARN: Defender real-time protection is OFF' }
+    if (-not $mpStat.RealTimeProtectionEnabled) {
+        # Defender goes passive when a third-party AV registers with Security Center (expected, not a fault).
+        $av = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -EA SilentlyContinue | Where-Object displayName -notlike '*Defender*' | ForEach-Object displayName)
+        if ($av) { Write-Log ("  Defender real-time OFF - third-party AV active: " + ($av -join ', ') + " (Defender-dependent items: ASR, CFA, Defender settings may not apply)") }
+        else { Write-Warn 'Defender real-time protection is OFF and no other AV is registered' }
+    }
 }
 
 # --- Credential hardening (CIS 2.3.x, DISA STIG WN11-SO-*) ---
@@ -714,7 +821,7 @@ $secPolFile = Join-Path $Root 'SecPolBackup.inf'
 if (-not (Test-Path $secPolFile)) {
     secedit /export /cfg $secPolFile /areas SECURITYPOLICY | Out-Null
     if (Test-Path $secPolFile) { if ($null -eq $Backup.SecPolFile) { $Backup.SecPolFile = $secPolFile } }
-    else { Write-Log '  WARN: could not export security policy - account lockout NOT applied' }
+    else { Write-Warn 'could not export security policy - account lockout NOT applied' }
 }
 if (Test-Path $secPolFile) {
     net accounts /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15 | Out-Null
@@ -726,7 +833,7 @@ $auditPolFile = Join-Path $Root 'AuditPolBackup.pol'
 if (-not (Test-Path $auditPolFile)) {
     auditpol /backup /file:$auditPolFile | Out-Null
     if (Test-Path $auditPolFile) { if ($null -eq $Backup.AuditPolFile) { $Backup.AuditPolFile = $auditPolFile } }
-    else { Write-Log '  WARN: could not back up audit policy - audit subcategories NOT set' }
+    else { Write-Warn 'could not back up audit policy - audit subcategories NOT set' }
 }
 if (Test-Path $auditPolFile) {
     Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1
@@ -738,7 +845,7 @@ if (Test-Path $auditPolFile) {
     auditpol /set /subcategory:'Account Lockout' /success:disable /failure:enable | Out-Null
     if ($LASTEXITCODE -ne 0) { $auditFailures++ }
     if ($auditFailures -eq 0) { Write-Log '  audit policy: key subcategories enabled (logon, credential validation, policy change, integrity)' }
-    else { Write-Log "  WARN: $auditFailures auditpol call(s) failed - check transcript" }
+    else { Write-Warn "$auditFailures auditpol call(s) failed - check transcript" }
 }
 
 # --- Firewall logging (CIS 9.x; SANS) ---
@@ -759,9 +866,13 @@ try {
     $cpuInfo = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
     $tpmInfo = Get-Tpm -ErrorAction SilentlyContinue
     $sbInfo  = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
-    if ($cpuInfo.VirtualizationFirmwareEnabled -and $tpmInfo.TpmPresent -and $sbInfo) { $vbsOk = $true }
-    else { Write-Log ("  SKIP VBS: hardware missing (cpu-virt=" + $cpuInfo.VirtualizationFirmwareEnabled + " tpm=" + $tpmInfo.TpmPresent + " secureboot=" + $sbInfo + ")") }
-} catch { Write-Log '  SKIP VBS: could not verify hardware support' }
+    # Win32_Processor reports VirtualizationFirmwareEnabled=False whenever a hypervisor is
+    # already running (Hyper-V/VBS active), so treat HypervisorPresent as "virtualization OK".
+    $hvPresent = [bool](Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).HypervisorPresent
+    $cpuVirt   = [bool]$cpuInfo.VirtualizationFirmwareEnabled -or $hvPresent
+    if ($cpuVirt -and $tpmInfo.TpmPresent -and $sbInfo) { $vbsOk = $true }
+    else { Write-Warn ("VBS skipped: hardware not ready (cpu-virt=" + $cpuVirt + " hypervisor=" + $hvPresent + " tpm=" + $tpmInfo.TpmPresent + " secureboot=" + $sbInfo + ")" + $(if (-not $cpuVirt) { ' - enable Intel VT-x / AMD SVM in BIOS/UEFI, then re-run' } else { '' })) }
+} catch { Write-Warn 'VBS skipped: could not verify hardware support' }
 if ($vbsOk) {
     Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\DeviceGuard' 'EnableVirtualizationBasedSecurity' 1
     Set-Reg HKLM 'SYSTEM\CurrentControlSet\Control\DeviceGuard' 'RequirePlatformSecurityFeatures' 1
@@ -777,7 +888,7 @@ Write-Log '  defense-in-depth settings applied'
 if (Get-Command Get-BitLockerVolume -EA SilentlyContinue) {
     $blv = Get-BitLockerVolume -MountPoint $env:SystemDrive -EA SilentlyContinue
     if ($blv) { Write-Log ("  BitLocker $($env:SystemDrive): " + $blv.ProtectionStatus + " / " + $blv.VolumeStatus) }
-    if ($blv -and $blv.ProtectionStatus -ne 'On') { Write-Log '  WARN: OS drive not BitLocker-protected - enable with recovery key escrowed to Entra/AD' }
+    if ($blv -and $blv.ProtectionStatus -ne 'On') { Write-Warn 'OS drive not BitLocker-protected - enable with recovery key escrowed to Entra/AD' }
 }
 
 # ---------------------------------------------------------------- 5. file cleanup
@@ -808,10 +919,10 @@ if (Test-Path $guardSrc) {
         $ErrorActionPreference = 'Continue'
     } catch {
         $ErrorActionPreference = 'Continue'
-        Write-Log ("WARN: could not install TelemetryGuard files: " + $_.Exception.Message)
+        Write-Warn ("could not install TelemetryGuard files: " + $_.Exception.Message)
     }
 } else {
-    Write-Log 'WARN: TelemetryGuard.ps1 not found next to this script - guard will not be installed.'
+    Write-Warn 'TelemetryGuard.ps1 not found next to this script - guard will not be installed.'
 }
 
 # Remove the old broken Startup-folder entry (shortcut + unassociated .ps1/.log)
@@ -841,9 +952,8 @@ try {
     Save-Backup
     Write-Log '== Hardening complete. Backup saved to HardenBackup.json =='
     Write-Log '== Run Undo-Hardening.ps1 (as admin) to fully revert. =='
-    if ($Error.Count -gt 0 -and $LogPath) {
-        Write-Log "NOTE: $($Error.Count) error record(s) were logged during this run - review $LogPath"
-    }
+    if ($script:WarnCount -gt 0) { Write-Log "NOTE: $($script:WarnCount) warning(s) - search the log for 'WARN:' - $LogPath" }
+    else { Write-Log 'No warnings.' }
     Stop-Transcript
     exit 0
 } catch {

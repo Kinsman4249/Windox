@@ -58,6 +58,7 @@ powershell -ExecutionPolicy Bypass -File .\Harden-Windows.ps1 -SkipServices -Ski
 - `-SkipNetwork` - leave network hardening alone
 - `-SkipCleanup` - skip cleanup steps
 - `-NoConfirm` - skip the interactive safety confirmation (scripted installs)
+- `-ForceDefenderSettings` - write Defender ASR, Network Protection, cloud, PUA, and Controlled Folder Access settings even when a third-party AV is the active engine. By default these are skipped when Defender is not in Normal mode; the script logs the detected AV and Defender mode at start.
 - `-Aggressive` - unmanaged/personal devices only. Also blocks OneDrive sync, cloud push notifications, and the MDM push service (`dmwappushservice` - breaks Intune sync), disables Office connected experiences (AutoSave, co-authoring, online templates), and removes Store-delivered To Do, Microsoft 365 hub, new Outlook, Teams, and OneNote. TelemetryGuard re-enforces the OneDrive/push/MDM-push settings in this mode. Without it, OneDrive, Office cloud features, and Intune sync stay at Windows defaults.
 
 `Undo-Hardening.ps1` accepts `-KeepTelemetryGuard` to revert the hardening but leave the telemetry guard in place.

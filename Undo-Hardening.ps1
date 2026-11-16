@@ -78,11 +78,16 @@ foreach ($a in @($Backup.Apps)) {
 if ($Backup.Defender) {
     Write-Log '== Restoring Defender ASR + cloud settings =='
     $oldIds = @($Backup.Defender.ASRIds); $oldActs = @($Backup.Defender.ASRAction)
-    if ($oldIds.Count -gt 0 -and $oldIds[0]) {
-        Set-MpPreference -AttackSurfaceReductionRules_Ids $oldIds -AttackSurfaceReductionRules_Actions $oldActs
-    } else {
-        Set-MpPreference -AttackSurfaceReductionRules_Ids @() -AttackSurfaceReductionRules_Actions @()
-    }
+    # try/catch: Defender may be passive (third-party AV) or Tamper Protection may refuse the change.
+    try {
+        if ($oldIds.Count -gt 0 -and $oldIds[0]) {
+            Set-MpPreference -AttackSurfaceReductionRules_Ids $oldIds -AttackSurfaceReductionRules_Actions $oldActs -ErrorAction Stop
+        } else {
+            # Remove the rules this script added (empty-array Set-MpPreference is rejected).
+            $cur = @((Get-MpPreference -EA SilentlyContinue).AttackSurfaceReductionRules_Ids)
+            if ($cur.Count -gt 0 -and $cur[0]) { Remove-MpPreference -AttackSurfaceReductionRules_Ids $cur -ErrorAction Stop }
+        }
+    } catch { Write-Log ("  WARN: ASR rules not restored: " + $_.Exception.Message) }
     # Restore simple scalar Defender settings to baseline defaults
     if (Get-Command Set-MpPreference -EA SilentlyContinue) {
         $cbl  = if ($null -ne $Backup.Defender.CloudBlockLevel)       { $Backup.Defender.CloudBlockLevel }       else { 0 }
